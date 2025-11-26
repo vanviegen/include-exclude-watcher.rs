@@ -1,4 +1,4 @@
-# include-exclude-watcher
+# include-exclude-watcher.rs
 
 Async file watcher with glob-based include/exclude patterns. Linux only (inotify).
 
@@ -10,12 +10,13 @@ This crate:
 - Exposes an easy-to-use tokio async/await API
 - Supports gitignore-style patterns out of the box
 - Only watches directories that could match your include/exclude patterns
-- Has built-in debouncing
+- Provides debouncing
+- Has minimal dependencies (libc and 2 tokio features)
 
 Tradeoffs:
 - Linux only (uses inotify directly)
 - Simpler pattern syntax than full gitignore
-- Patterns cannot be modified on a running watcher
+- Patterns on a running watcher cannot be modified
 
 ## Installation
 

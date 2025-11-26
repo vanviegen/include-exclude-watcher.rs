@@ -149,10 +149,144 @@ use tokio::io::unix::AsyncFd;
 
 // --- Pattern Parsing ---
 
+/// Simple glob pattern matcher for a single path component.
+/// Supports: * (any chars), ? (single char), [abc] (char class), [a-z] (range)
+#[derive(Debug, Clone)]
+struct GlobPattern {
+    pattern: String,
+}
+
+impl PartialEq for GlobPattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern
+    }
+}
+
+impl GlobPattern {
+    fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_string(),
+        }
+    }
+
+    fn matches(&self, text: &str) -> bool {
+        Self::match_recursive(self.pattern.as_bytes(), text.as_bytes())
+    }
+
+    fn match_recursive(pattern: &[u8], text: &[u8]) -> bool {
+        let mut p = 0;
+        let mut t = 0;
+
+        // For backtracking on '*'
+        let mut star_p = None;
+        let mut star_t = None;
+
+        while t < text.len() {
+            if p < pattern.len() {
+                match pattern[p] {
+                    b'*' => {
+                        // '*' matches zero or more characters
+                        star_p = Some(p);
+                        star_t = Some(t);
+                        p += 1;
+                        continue;
+                    }
+                    b'?' => {
+                        // '?' matches exactly one character
+                        p += 1;
+                        t += 1;
+                        continue;
+                    }
+                    b'[' => {
+                        // Character class
+                        if let Some((matched, end_pos)) =
+                            Self::match_char_class(&pattern[p..], text[t])
+                        {
+                            if matched {
+                                p += end_pos;
+                                t += 1;
+                                continue;
+                            }
+                        }
+                        // Fall through to backtrack
+                    }
+                    c => {
+                        // Literal character match
+                        if c == text[t] {
+                            p += 1;
+                            t += 1;
+                            continue;
+                        }
+                        // Fall through to backtrack
+                    }
+                }
+            }
+
+            // No match at current position, try backtracking
+            if let (Some(sp), Some(st)) = (star_p, star_t) {
+                // Backtrack: make '*' match one more character
+                p = sp + 1;
+                star_t = Some(st + 1);
+                t = st + 1;
+            } else {
+                return false;
+            }
+        }
+
+        // Consume any trailing '*' in pattern
+        while p < pattern.len() && pattern[p] == b'*' {
+            p += 1;
+        }
+
+        p == pattern.len()
+    }
+
+    /// Match a character class like [abc] or [a-z] or [!abc]
+    /// Returns (matched, bytes_consumed) if valid class, None if invalid
+    fn match_char_class(pattern: &[u8], ch: u8) -> Option<(bool, usize)> {
+        if pattern.is_empty() || pattern[0] != b'[' {
+            return None;
+        }
+
+        let mut i = 1;
+        let mut matched = false;
+        let negated = i < pattern.len() && (pattern[i] == b'!' || pattern[i] == b'^');
+        if negated {
+            i += 1;
+        }
+
+        while i < pattern.len() {
+            if pattern[i] == b']' && i > 1 + (negated as usize) {
+                // End of character class
+                return Some((matched != negated, i + 1));
+            }
+
+            // Check for range: a-z
+            if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
+                let start = pattern[i];
+                let end = pattern[i + 2];
+                if ch >= start && ch <= end {
+                    matched = true;
+                }
+                i += 3;
+            } else {
+                // Single character
+                if pattern[i] == ch {
+                    matched = true;
+                }
+                i += 1;
+            }
+        }
+
+        // No closing bracket found
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 enum Segment {
     Exact(String),
-    Wildcard(glob::Pattern),
+    Wildcard(GlobPattern),
     DoubleWildcard, // **
 }
 
@@ -182,11 +316,7 @@ impl Pattern {
             if part == "**" {
                 segments.push(Segment::DoubleWildcard);
             } else if part.contains('*') || part.contains('?') || part.contains('[') {
-                if let Ok(p) = glob::Pattern::new(part) {
-                    segments.push(Segment::Wildcard(p));
-                } else {
-                    segments.push(Segment::Exact(part.to_string()));
-                }
+                segments.push(Segment::Wildcard(GlobPattern::new(part)));
             } else {
                 segments.push(Segment::Exact(part.to_string()));
             }
@@ -957,6 +1087,13 @@ impl WatchBuilder {
                                     }
                                 }
                             }
+                        }
+                    }
+                    
+                    // If debouncing and we had events, reset the timer
+                    if let Some(d) = debounce {
+                        if had_matching_event {
+                            debounce_deadline = Some(tokio::time::Instant::now() + d);
                         }
                     }
                 }
