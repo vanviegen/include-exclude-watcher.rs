@@ -333,11 +333,13 @@ impl Pattern {
             let pattern_segment = &pattern_segments[pattern_index];
 
             if path_index >= path_segments.len() {
-                if pattern_segment == &Segment::DoubleWildcard
-                    && pattern_index == pattern_segments.len() - 1
+                // We ran out of path elements
+                if pattern_segment == &Segment::DoubleWildcard && pattern_index == pattern_segments.len() - 1
                 {
+                    // The only pattern segment we still need to match is **. We'll consider that a match for the parent.
                     return true;
                 }
+                // Something within this path could potentially match.
                 return allow_prefix;
             }
 
@@ -356,6 +358,8 @@ impl Pattern {
                 }
                 Segment::DoubleWildcard => {
                     if allow_prefix {
+                        // If we're matching a **, there can always be some deeply nested dir structure that
+                        // will match the rest of our pattern. So for prefix matching, the answer is always true.
                         return true;
                     }
 
@@ -369,7 +373,14 @@ impl Pattern {
             }
         }
 
-        allow_prefix || path_index == path_segments.len()
+        // If there are spurious path elements, this is not a match.
+        if path_index < path_segments.len() {
+            return false;
+        }
+
+        // We have an exact match. However when in allow_prefix mode, that means this directory is the target
+        // and its contents does not need to be watched.
+        return !allow_prefix;
     }
 }
 
@@ -465,7 +476,7 @@ fn should_watch(
     is_dir: bool,
 ) -> bool {
     let segments = path_to_segments(relative_path);
-
+    
     if exclude_patterns.iter().any(|p| p.check(&segments, false)) {
         return false;
     }
@@ -473,8 +484,17 @@ fn should_watch(
     include_patterns.iter().any(|p| p.check(&segments, is_dir))
 }
 
+const INOTIFY_MASK: u32 = libc::IN_MODIFY
+    | libc::IN_CLOSE_WRITE
+    | libc::IN_CREATE
+    | libc::IN_DELETE
+    | libc::IN_MOVED_FROM
+    | libc::IN_MOVED_TO
+    | libc::IN_DONT_FOLLOW;
+
+
 fn add_watch_recursive<F>(
-    start_rel_path: PathBuf,
+    initial_path: PathBuf,
     root: &Path,
     inotify: &Inotify,
     watches: &mut HashMap<i32, PathBuf>,
@@ -487,13 +507,13 @@ fn add_watch_recursive<F>(
 ) where
     F: FnMut(WatchEvent, PathBuf),
 {
-    let mut stack = vec![start_rel_path];
+    if paths.contains(&initial_path) {
+        return;
+    }
+
+    let mut stack = vec![initial_path];
     while let Some(rel_path) = stack.pop() {
         if !should_watch(&rel_path, include_patterns, exclude_patterns, true) {
-            continue;
-        }
-
-        if paths.contains(&rel_path) {
             continue;
         }
 
@@ -507,94 +527,39 @@ fn add_watch_recursive<F>(
             continue;
         }
 
-        let mask = libc::IN_MODIFY
-            | libc::IN_CLOSE_WRITE
-            | libc::IN_CREATE
-            | libc::IN_DELETE
-            | libc::IN_MOVED_FROM
-            | libc::IN_MOVED_TO
-            | libc::IN_DONT_FOLLOW;
-        match inotify.add_watch(&full_path, mask as u32) {
-            Ok(wd) => {
-                paths.insert(rel_path.clone());
-                watches.insert(wd, rel_path.clone());
+        let wd = match inotify.add_watch(&full_path, INOTIFY_MASK) {
+            Ok(wd) => wd,
+            Err(e) => {
+                eprintln!("Failed to add watch for {:?}: {}", full_path, e);
+                continue;
+            }
+        };
 
-                if debug_watches_enabled {
-                    let callback_path = if return_absolute {
-                        full_path.clone()
-                    } else {
-                        rel_path.clone()
-                    };
-                    callback(WatchEvent::DebugWatch, callback_path);
-                }
+        paths.insert(rel_path.clone());
+        watches.insert(wd, rel_path.clone());
 
-                if let Ok(entries) = std::fs::read_dir(&full_path) {
-                    for entry in entries.flatten() {
-                        if let Ok(ft) = entry.file_type() {
-                            if ft.is_dir() {
-                                let child_rel_path = if rel_path.as_os_str().is_empty() {
-                                    PathBuf::from(entry.file_name())
-                                } else {
-                                    rel_path.join(entry.file_name())
-                                };
-                                stack.push(child_rel_path);
-                            }
+        if debug_watches_enabled {
+            let callback_path = if return_absolute {
+                full_path.clone()
+            } else {
+                rel_path.clone()
+            };
+            callback(WatchEvent::DebugWatch, callback_path);
+        }
+
+        if let Ok(entries) = std::fs::read_dir(&full_path) {
+            for entry in entries.flatten() {
+                if let Ok(ft) = entry.file_type() {
+                    if ft.is_dir() {
+                        let child_rel_path = rel_path.join(entry.file_name());
+                        if !paths.contains(&child_rel_path) {
+                            stack.push(child_rel_path);
                         }
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("{}", e);
-            }
         }
     }
-}
-
-fn find_watch_start_dir(pattern: &Pattern, root: &Path) -> PathBuf {
-    let mut current_path = PathBuf::new();
-    let mut found_wildcard = false;
-
-    for segment in &pattern.segments {
-        match segment {
-            Segment::Exact(s) => {
-                if !found_wildcard {
-                    current_path.push(s);
-                }
-            }
-            _ => {
-                found_wildcard = true;
-                break;
-            }
-        }
-    }
-
-    if found_wildcard && !current_path.as_os_str().is_empty() {
-        current_path.pop();
-    }
-
-    if !found_wildcard && !current_path.as_os_str().is_empty() {
-        current_path.pop();
-    }
-
-    loop {
-        let full_path = if current_path.as_os_str().is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(&current_path)
-        };
-
-        if full_path.exists() && full_path.is_dir() {
-            break;
-        }
-
-        if current_path.as_os_str().is_empty() {
-            break;
-        }
-
-        current_path.pop();
-    }
-
-    current_path
 }
 
 fn parse_inotify_events(buffer: &[u8], len: usize) -> Vec<(i32, u32, String)> {
@@ -956,21 +921,18 @@ impl WatchBuilder {
         let mut paths = HashSet::<PathBuf>::new();
 
         // Initial scan
-        for pattern in &include_patterns {
-            let watch_dir = find_watch_start_dir(pattern, &root);
-            add_watch_recursive(
-                watch_dir,
-                &root,
-                &inotify,
-                &mut watches,
-                &mut paths,
-                &include_patterns,
-                &exclude_patterns,
-                debug_watches_enabled,
-                return_absolute,
-                &mut callback,
-            );
-        }
+        add_watch_recursive(
+            PathBuf::new(),
+            &root,
+            &inotify,
+            &mut watches,
+            &mut paths,
+            &include_patterns,
+            &exclude_patterns,
+            debug_watches_enabled,
+            return_absolute,
+            &mut callback,
+        );
 
         // Debouncing state
         let mut debounce_deadline: Option<tokio::time::Instant> = None;
@@ -1011,82 +973,77 @@ impl WatchBuilder {
                     let mut had_matching_event = false;
 
                     for (wd, mask, name_str) in events {
-                        let rel_path = {
-                            if (mask & libc::IN_IGNORED as u32) != 0 {
-                                if let Some(path) = watches.remove(&wd) {
-                                    paths.remove(&path);
-                                }
-                                continue;
+                        if (mask & libc::IN_IGNORED as u32) != 0 {
+                            if let Some(path) = watches.remove(&wd) {
+                                paths.remove(&path);
                             }
-                            if let Some(dir_path) = watches.get(&wd) {
-                                Some(dir_path.join(&name_str))
-                            } else {
-                                None
-                            }
+                            continue;
+                        }
+
+                        let rel_path = if let Some(dir_path) = watches.get(&wd) {
+                            dir_path.join(&name_str)
+                        } else {
+                            println!("Warning: received event for unknown watch descriptor {}", wd);
+                            continue;
                         };
 
-                        if let Some(rel_path) = rel_path {
-                            if (mask & libc::IN_ISDIR as u32) != 0 {
-                                if (mask & libc::IN_CREATE as u32) != 0
-                                    || (mask & libc::IN_MOVED_TO as u32) != 0
-                                {
-                                    add_watch_recursive(
-                                        rel_path.clone(),
-                                        &root,
-                                        &inotify,
-                                        &mut watches,
-                                        &mut paths,
-                                        &include_patterns,
-                                        &exclude_patterns,
-                                        debug_watches_enabled,
-                                        return_absolute,
-                                        &mut callback,
-                                    );
-                                }
-                            }
+                        let is_dir = mask & libc::IN_ISDIR as u32 != 0;
+                        let is_create = (mask & libc::IN_CREATE as u32) != 0
+                            || (mask & libc::IN_MOVED_TO as u32) != 0;
+                        let is_delete = (mask & libc::IN_DELETE as u32) != 0
+                            || (mask & libc::IN_MOVED_FROM as u32) != 0;
+                        let is_update = (mask & libc::IN_MODIFY as u32) != 0
+                            || (mask & libc::IN_CLOSE_WRITE as u32) != 0;
 
-                            if should_watch(&rel_path, &include_patterns, &exclude_patterns, false)
-                            {
-                                let is_create = (mask & libc::IN_CREATE as u32) != 0
-                                    || (mask & libc::IN_MOVED_TO as u32) != 0;
-                                let is_delete = (mask & libc::IN_DELETE as u32) != 0
-                                    || (mask & libc::IN_MOVED_FROM as u32) != 0;
-                                let is_update = (mask & libc::IN_MODIFY as u32) != 0
-                                    || (mask & libc::IN_CLOSE_WRITE as u32) != 0;
 
-                                let event_type = if is_create && watch_create {
-                                    Some(WatchEvent::Create)
-                                } else if is_delete && watch_delete {
-                                    Some(WatchEvent::Delete)
-                                } else if is_update && watch_update {
-                                    Some(WatchEvent::Update)
+                        if is_dir && is_create {
+                            // New directory created 
+                            add_watch_recursive(
+                                rel_path.clone(),
+                                &root,
+                                &inotify,
+                                &mut watches,
+                                &mut paths,
+                                &include_patterns,
+                                &exclude_patterns,
+                                debug_watches_enabled,
+                                return_absolute,
+                                &mut callback,
+                            );
+                        }
+
+                        let event_type = if is_create && watch_create {
+                            WatchEvent::Create
+                        } else if is_delete && watch_delete {
+                            WatchEvent::Delete
+                        } else if is_update && watch_update {
+                            WatchEvent::Update
+                        } else {
+                            continue
+                        };
+
+                        if if is_dir { !match_dirs } else { !match_files } {
+                            continue;
+                        }
+
+                        if !should_watch(&rel_path, &include_patterns, &exclude_patterns, false) {
+                            continue;
+                        }
+
+                        had_matching_event = true;
+                        
+                        // Do callback if not in debounce mode
+                        if debounce.is_none() {
+                            let callback_path = if return_absolute {
+                                if rel_path.as_os_str().is_empty() {
+                                    root.clone()
                                 } else {
-                                    None
-                                };
-
-                                if let Some(event_type) = event_type {
-                                    let is_dir = (mask & libc::IN_ISDIR as u32) != 0;
-                                    let should_match_type = if is_dir { match_dirs } else { match_files };
-
-                                    if should_match_type {
-                                        had_matching_event = true;
-                                        
-                                        // Only call immediately if not debouncing
-                                        if debounce.is_none() {
-                                            let callback_path = if return_absolute {
-                                                if rel_path.as_os_str().is_empty() {
-                                                    root.clone()
-                                                } else {
-                                                    root.join(&rel_path)
-                                                }
-                                            } else {
-                                                rel_path
-                                            };
-                                            callback(event_type, callback_path);
-                                        }
-                                    }
+                                    root.join(&rel_path)
                                 }
-                            }
+                            } else {
+                                rel_path
+                            };
+                            callback(event_type, callback_path);
                         }
                     }
                     
@@ -1190,7 +1147,7 @@ mod tests {
         }
 
         fn create_dir(&self, path: &str) {
-            std::fs::create_dir(self.test_dir.join(path)).unwrap();
+            std::fs::create_dir_all(self.test_dir.join(path)).unwrap();
         }
 
         fn write_file(&self, path: &str, content: &str) {
@@ -1362,6 +1319,26 @@ mod tests {
 
         test.write_file("test.rs", "");
         test.assert_no_events().await;
+    }
+
+    #[tokio::test]
+    async fn test_matching_stops_at_depth() {
+        let test = TestInstance::new("matching_stops_at_depth", |b| b.add_include("*/xyz/*.*")).await;
+
+        test.write_file("test.txt", "");
+        test.assert_no_events().await;
+
+        test.create_dir("abc/xyz");
+        test.assert_events(&[], &[], &[], &["abc", "abc/xyz"]).await;
+
+        test.create_dir("abc/hjk/a.b");
+        test.assert_no_events().await;
+
+        test.create_dir("abc/xyz/a.b");
+        test.assert_events(&["abc/xyz/a.b"], &[], &[], &[]).await; // Should not watch the a.b dir
+
+        test.create_dir("abc/xyz/a.b/x.y");
+        test.assert_events(&[], &[], &[], &[]).await;
     }
 
     #[tokio::test]
