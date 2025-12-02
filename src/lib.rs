@@ -24,11 +24,11 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use include_exclude_watcher::{WatchBuilder, WatchEvent};
+//! use include_exclude_watcher::{Watcher, WatchEvent};
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
-//!     WatchBuilder::new()
+//!     Watcher::new()
 //!         .set_base_dir("./src")
 //!         .add_include("**/*.rs")
 //!         .add_exclude("**/target/**")
@@ -45,11 +45,11 @@
 //! for changes to settle before taking action:
 //!
 //! ```no_run
-//! use include_exclude_watcher::WatchBuilder;
+//! use include_exclude_watcher::Watcher;
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
-//!     WatchBuilder::new()
+//!     Watcher::new()
 //!         .set_base_dir("./src")
 //!         .add_include("**/*.rs")
 //!         .run_debounced(500, || {
@@ -93,11 +93,11 @@
 //! You can load exclude patterns from gitignore-style files:
 //!
 //! ```no_run
-//! use include_exclude_watcher::WatchBuilder;
+//! use include_exclude_watcher::Watcher;
 //!
 //! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
-//!     WatchBuilder::new()
+//!     Watcher::new()
 //!         .set_base_dir("/project")
 //!         .add_include("**/*")
 //!         .add_ignore_file(".gitignore")
@@ -120,10 +120,10 @@
 //! You can filter which events to receive and what types to match:
 //!
 //! ```no_run
-//! use include_exclude_watcher::WatchBuilder;
+//! use include_exclude_watcher::Watcher;
 //!
 //! # async fn example() -> std::io::Result<()> {
-//! WatchBuilder::new()
+//! Watcher::new()
 //!     .add_include("**/*.rs")
 //!     .watch_create(true)   // Receive create events
 //!     .watch_delete(true)   // Receive delete events
@@ -449,16 +449,6 @@ impl Drop for Inotify {
 
 // --- Helper Functions ---
 
-fn resolve_base_dir(base_dir: PathBuf) -> PathBuf {
-    if base_dir.is_absolute() {
-        base_dir
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("/"))
-            .join(base_dir)
-    }
-}
-
 fn path_to_segments(path: &Path) -> Vec<String> {
     let path_str = path.to_string_lossy();
     let path_str = path_str.replace("//", "/");
@@ -469,21 +459,6 @@ fn path_to_segments(path: &Path) -> Vec<String> {
         .collect()
 }
 
-fn should_watch(
-    relative_path: &Path,
-    include_patterns: &[Pattern],
-    exclude_patterns: &[Pattern],
-    is_dir: bool,
-) -> bool {
-    let segments = path_to_segments(relative_path);
-    
-    if exclude_patterns.iter().any(|p| p.check(&segments, false)) {
-        return false;
-    }
-
-    include_patterns.iter().any(|p| p.check(&segments, is_dir))
-}
-
 const INOTIFY_MASK: u32 = libc::IN_MODIFY
     | libc::IN_CLOSE_WRITE
     | libc::IN_CREATE
@@ -492,75 +467,6 @@ const INOTIFY_MASK: u32 = libc::IN_MODIFY
     | libc::IN_MOVED_TO
     | libc::IN_DONT_FOLLOW;
 
-
-fn add_watch_recursive<F>(
-    initial_path: PathBuf,
-    root: &Path,
-    inotify: &Inotify,
-    watches: &mut HashMap<i32, PathBuf>,
-    paths: &mut HashSet<PathBuf>,
-    include_patterns: &[Pattern],
-    exclude_patterns: &[Pattern],
-    debug_watches_enabled: bool,
-    return_absolute: bool,
-    callback: &mut F,
-) where
-    F: FnMut(WatchEvent, PathBuf),
-{
-    if paths.contains(&initial_path) {
-        return;
-    }
-
-    let mut stack = vec![initial_path];
-    while let Some(rel_path) = stack.pop() {
-        if !should_watch(&rel_path, include_patterns, exclude_patterns, true) {
-            continue;
-        }
-
-        let full_path = if rel_path.as_os_str().is_empty() {
-            root.to_path_buf()
-        } else {
-            root.join(&rel_path)
-        };
-
-        if !full_path.is_dir() {
-            continue;
-        }
-
-        let wd = match inotify.add_watch(&full_path, INOTIFY_MASK) {
-            Ok(wd) => wd,
-            Err(e) => {
-                eprintln!("Failed to add watch for {:?}: {}", full_path, e);
-                continue;
-            }
-        };
-
-        paths.insert(rel_path.clone());
-        watches.insert(wd, rel_path.clone());
-
-        if debug_watches_enabled {
-            let callback_path = if return_absolute {
-                full_path.clone()
-            } else {
-                rel_path.clone()
-            };
-            callback(WatchEvent::DebugWatch, callback_path);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&full_path) {
-            for entry in entries.flatten() {
-                if let Ok(ft) = entry.file_type() {
-                    if ft.is_dir() {
-                        let child_rel_path = rel_path.join(entry.file_name());
-                        if !paths.contains(&child_rel_path) {
-                            stack.push(child_rel_path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
 
 fn parse_inotify_events(buffer: &[u8], len: usize) -> Vec<(i32, u32, String)> {
     let mut events = Vec::new();
@@ -607,25 +513,31 @@ pub enum WatchEvent {
     /// opened for writing was closed). Directory content changes (files added/removed)
     /// are reported as [`Create`](WatchEvent::Create)/[`Delete`](WatchEvent::Delete) instead.
     Update,
+    /// Initial event for preexisting files/directories.
+    ///
+    /// Only emitted when [`Watcher::watch_initial`] is enabled. Fired once
+    /// for each file or directory that matches the patterns at the time the
+    /// watcher starts, before any file system events are processed.
+    Initial,
     /// Debug event: a watch was added on this directory.
     ///
-    /// Only emitted when [`WatchBuilder::debug_watches`] is enabled. Useful for
+    /// Only emitted when [`Watcher::debug_watches`] is enabled. Useful for
     /// understanding which directories are being watched based on your patterns.
     DebugWatch,
 }
 
 /// Builder for configuring and running a file watcher.
 ///
-/// Use method chaining to configure the watcher, then call [`run`](WatchBuilder::run)
-/// or [`run_debounced`](WatchBuilder::run_debounced) to start watching.
+/// Use method chaining to configure the watcher, then call [`run`](Watcher::run)
+/// or [`run_debounced`](Watcher::run_debounced) to start watching.
 ///
 /// # Example
 ///
 /// ```no_run
-/// use include_exclude_watcher::WatchBuilder;
+/// use include_exclude_watcher::Watcher;
 ///
 /// # async fn example() -> std::io::Result<()> {
-/// WatchBuilder::new()
+/// Watcher::new()
 ///     .set_base_dir("/project")
 ///     .add_include("src/**/*.rs")
 ///     .add_include("Cargo.toml")
@@ -636,43 +548,60 @@ pub enum WatchEvent {
 ///     .await
 /// # }
 /// ```
-pub struct WatchBuilder {
-    includes: Option<Vec<String>>,
+pub struct Watcher {
+    includes: Vec<String>,
     excludes: Vec<String>,
     base_dir: PathBuf,
     watch_create: bool,
     watch_delete: bool,
     watch_update: bool,
+    watch_initial: bool,
     match_files: bool,
     match_dirs: bool,
     return_absolute: bool,
     debug_watches_enabled: bool,
 }
 
-impl Default for WatchBuilder {
+/// Backwards compatibility alias for [`Watcher`].
+#[deprecated(since = "0.1.2", note = "Renamed to Watcher")]
+pub type WatchBuilder = Watcher;
+
+impl Default for Watcher {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl WatchBuilder {
-    /// Create a new file watcher builder with default settings.
+// Runtime state for the watcher
+struct WatcherState<F> {
+    root: PathBuf,
+    inotify: Inotify,
+    watches: HashMap<i32, PathBuf>,
+    paths: HashSet<PathBuf>,
+    include_patterns: Vec<Pattern>,
+    exclude_patterns: Vec<Pattern>,
+    callback: F,
+}
+
+impl Watcher {
+    /// Create a new file watcher with default settings.
     ///
     /// Defaults:
     /// - Base directory: current working directory
     /// - Includes: none (must be added, or watches everything)
     /// - Excludes: none
-    /// - Event types: create, delete, update all enabled
+    /// - Event types: create, delete, update all enabled; initial disabled
     /// - Match types: both files and directories
     /// - Path format: relative paths
     pub fn new() -> Self {
-        WatchBuilder {
-            includes: Some(Vec::new()),
+        Watcher {
+            includes: Vec::new(),
             excludes: Vec::new(),
             base_dir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
             watch_create: true,
             watch_delete: true,
             watch_update: true,
+            watch_initial: false,
             match_files: true,
             match_dirs: true,
             return_absolute: false,
@@ -700,22 +629,13 @@ impl WatchBuilder {
     /// Patterns without a `/` match anywhere in the tree (like gitignore).
     /// For example, `*.rs` is equivalent to `**/*.rs`.
     pub fn add_include(mut self, pattern: impl Into<String>) -> Self {
-        if self.includes.is_none() {
-            self.includes = Some(Vec::new());
-        }
-        self.includes.as_mut().unwrap().push(pattern.into());
+        self.includes.push(pattern.into());
         self
     }
 
     /// Add multiple include patterns.
     pub fn add_includes(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        if self.includes.is_none() {
-            self.includes = Some(Vec::new());
-        }
-        self.includes
-            .as_mut()
-            .unwrap()
-            .extend(patterns.into_iter().map(|p| p.into()));
+        self.includes.extend(patterns.into_iter().map(|p| p.into()));
         self
     }
 
@@ -729,8 +649,7 @@ impl WatchBuilder {
 
     /// Add multiple exclude patterns.
     pub fn add_excludes(mut self, patterns: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.excludes
-            .extend(patterns.into_iter().map(|p| p.into()));
+        self.excludes.extend(patterns.into_iter().map(|p| p.into()));
         self
     }
 
@@ -746,10 +665,10 @@ impl WatchBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use include_exclude_watcher::WatchBuilder;
+    /// use include_exclude_watcher::Watcher;
     ///
     /// # async fn example() -> std::io::Result<()> {
-    /// WatchBuilder::new()
+    /// Watcher::new()
     ///     .set_base_dir("/project")
     ///     .add_include("*")
     ///     .add_ignore_file(".gitignore")
@@ -830,6 +749,36 @@ impl WatchBuilder {
         self
     }
 
+    /// Set whether to emit initial events for preexisting files/directories.
+    ///
+    /// When enabled, [`WatchEvent::Initial`] events will be emitted for all
+    /// files and directories that match the patterns at startup, before any
+    /// file system events are processed. This is useful for building an initial
+    /// inventory of matching files.
+    ///
+    /// Default: `false`
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use include_exclude_watcher::Watcher;
+    ///
+    /// # async fn example() -> std::io::Result<()> {
+    /// Watcher::new()
+    ///     .add_include("**/*.rs")
+    ///     .watch_initial(true)
+    ///     .run(|event, path| {
+    ///         // First receives Initial events for all existing .rs files,
+    ///         // then receives Create/Update/Delete events for changes
+    ///     })
+    ///     .await
+    /// # }
+    /// ```
+    pub fn watch_initial(mut self, enabled: bool) -> Self {
+        self.watch_initial = enabled;
+        self
+    }
+
     /// Set whether to match regular files.
     ///
     /// Default: `true`
@@ -884,14 +833,121 @@ impl WatchBuilder {
         self.run_internal(|_, _| callback(), Some(Duration::from_millis(ms))).await
     }
 
-    async fn run_internal<F>(self, mut callback: F, debounce: Option<Duration>) -> Result<()>
+    fn should_watch<F>(&self, state: &WatcherState<F>, relative_path: &Path, is_dir: bool) -> bool {
+        let segments = path_to_segments(relative_path);
+        
+        if state.exclude_patterns.iter().any(|p| p.check(&segments, false)) {
+            return false;
+        }
+
+        state.include_patterns.iter().any(|p| p.check(&segments, is_dir))
+    }
+
+    fn make_callback_path<F>(&self, state: &WatcherState<F>, rel_path: &Path) -> PathBuf {
+        if self.return_absolute {
+            if rel_path.as_os_str().is_empty() {
+                state.root.clone()
+            } else {
+                state.root.join(rel_path)
+            }
+        } else {
+            rel_path.to_path_buf()
+        }
+    }
+
+    fn emit_event<F>(
+        &self,
+        state: &mut WatcherState<F>,
+        event: WatchEvent,
+        rel_path: &Path,
+        is_dir: bool,
+    ) where
+        F: FnMut(WatchEvent, PathBuf),
+    {
+        if if is_dir { !self.match_dirs } else { !self.match_files } {
+            return;
+        }
+
+        if !self.should_watch(state, rel_path, false) {
+            return;
+        }
+
+        let path = self.make_callback_path(state, rel_path);
+        (state.callback)(event, path);
+    }
+
+    fn add_watch_recursive<F>(
+        &self,
+        state: &mut WatcherState<F>,
+        initial_path: PathBuf,
+        emit_initial: bool,
+    ) where
+        F: FnMut(WatchEvent, PathBuf),
+    {
+        if state.paths.contains(&initial_path) {
+            return;
+        }
+
+        let mut stack = vec![initial_path];
+        while let Some(rel_path) = stack.pop() {
+            if !self.should_watch(state, &rel_path, true) {
+                continue;
+            }
+
+            let full_path = if rel_path.as_os_str().is_empty() {
+                state.root.clone()
+            } else {
+                state.root.join(&rel_path)
+            };
+
+            if !full_path.is_dir() {
+                continue;
+            }
+
+            let wd = match state.inotify.add_watch(&full_path, INOTIFY_MASK) {
+                Ok(wd) => wd,
+                Err(e) => {
+                    eprintln!("Failed to add watch for {:?}: {}", full_path, e);
+                    continue;
+                }
+            };
+
+            state.paths.insert(rel_path.clone());
+            state.watches.insert(wd, rel_path.clone());
+
+            if self.debug_watches_enabled {
+                let path = self.make_callback_path(state, &rel_path);
+                (state.callback)(WatchEvent::DebugWatch, path);
+            }
+
+            if let Ok(entries) = std::fs::read_dir(&full_path) {
+                for entry in entries.flatten() {
+                    if let Ok(ft) = entry.file_type() {
+                        let child_rel_path = rel_path.join(entry.file_name());
+                        let is_dir = ft.is_dir();
+
+                        if emit_initial {
+                            self.emit_event(state, WatchEvent::Initial, &child_rel_path, is_dir);
+                        }
+
+                        if is_dir && !state.paths.contains(&child_rel_path) {
+                            stack.push(child_rel_path);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn run_internal<F>(self, callback: F, debounce: Option<Duration>) -> Result<()>
     where
         F: FnMut(WatchEvent, PathBuf),
     {
-        let includes = if let Some(includes) = self.includes {
-            includes
-        } else {
+        // If no includes are specified, watch everything; if empty, sleep forever
+        let includes = if self.includes.is_empty() {
             vec!["**".to_string()]
+        } else {
+            self.includes.clone()
         };
 
         // If no includes are specified, just sleep forever
@@ -901,38 +957,27 @@ impl WatchBuilder {
             }
         }
 
-        let excludes = self.excludes;
-        let root = self.base_dir.clone();
-        let watch_create = self.watch_create;
-        let watch_delete = self.watch_delete;
-        let watch_update = self.watch_update;
-        let match_files = self.match_files;
-        let match_dirs = self.match_dirs;
-        let return_absolute = self.return_absolute;
-        let debug_watches_enabled = self.debug_watches_enabled;
+        let root = if self.base_dir.is_absolute() {
+            self.base_dir.clone()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("/"))
+                .join(&self.base_dir)
+        };
 
-        let root = resolve_base_dir(root);
+        let mut state = WatcherState {
+            root,
+            inotify: Inotify::new()?,
+            watches: HashMap::new(),
+            paths: HashSet::new(),
+            include_patterns: includes.iter().map(|p| Pattern::parse(p)).collect(),
+            exclude_patterns: self.excludes.iter().map(|p| Pattern::parse(p)).collect(),
+            callback,
+        };
 
-        let include_patterns: Vec<Pattern> = includes.iter().map(|p| Pattern::parse(p)).collect();
-        let exclude_patterns: Vec<Pattern> = excludes.iter().map(|p| Pattern::parse(p)).collect();
-
-        let inotify = Inotify::new()?;
-        let mut watches = HashMap::<i32, PathBuf>::new();
-        let mut paths = HashSet::<PathBuf>::new();
-
-        // Initial scan
-        add_watch_recursive(
-            PathBuf::new(),
-            &root,
-            &inotify,
-            &mut watches,
-            &mut paths,
-            &include_patterns,
-            &exclude_patterns,
-            debug_watches_enabled,
-            return_absolute,
-            &mut callback,
-        );
+        // Initial scan for watches (and optionally emit Initial events)
+        let emit_initial = self.watch_initial && debounce.is_none();
+        self.add_watch_recursive(&mut state, PathBuf::new(), emit_initial);
 
         // Debouncing state
         let mut debounce_deadline: Option<tokio::time::Instant> = None;
@@ -941,14 +986,14 @@ impl WatchBuilder {
         let mut buffer = [0u8; 8192];
         loop {
             // Calculate timeout for debouncing
-            let read_future = inotify.read_events(&mut buffer);
+            let read_future = state.inotify.read_events(&mut buffer);
             
             let read_result = if let Some(deadline) = debounce_deadline {
                 let now = tokio::time::Instant::now();
                 if deadline <= now {
                     // Timer expired, fire callback and reset
                     debounce_deadline = None;
-                    callback(WatchEvent::Update, PathBuf::new());
+                    (state.callback)(WatchEvent::Update, PathBuf::new());
                     continue;
                 }
                 // Wait with timeout
@@ -957,7 +1002,7 @@ impl WatchBuilder {
                     Err(_) => {
                         // Timeout expired, fire callback
                         debounce_deadline = None;
-                        callback(WatchEvent::Update, PathBuf::new());
+                        (state.callback)(WatchEvent::Update, PathBuf::new());
                         continue;
                     }
                 }
@@ -974,13 +1019,13 @@ impl WatchBuilder {
 
                     for (wd, mask, name_str) in events {
                         if (mask & libc::IN_IGNORED as u32) != 0 {
-                            if let Some(path) = watches.remove(&wd) {
-                                paths.remove(&path);
+                            if let Some(path) = state.watches.remove(&wd) {
+                                state.paths.remove(&path);
                             }
                             continue;
                         }
 
-                        let rel_path = if let Some(dir_path) = watches.get(&wd) {
+                        let rel_path = if let Some(dir_path) = state.watches.get(&wd) {
                             dir_path.join(&name_str)
                         } else {
                             println!("Warning: received event for unknown watch descriptor {}", wd);
@@ -995,38 +1040,26 @@ impl WatchBuilder {
                         let is_update = (mask & libc::IN_MODIFY as u32) != 0
                             || (mask & libc::IN_CLOSE_WRITE as u32) != 0;
 
-
                         if is_dir && is_create {
                             // New directory created 
-                            add_watch_recursive(
-                                rel_path.clone(),
-                                &root,
-                                &inotify,
-                                &mut watches,
-                                &mut paths,
-                                &include_patterns,
-                                &exclude_patterns,
-                                debug_watches_enabled,
-                                return_absolute,
-                                &mut callback,
-                            );
+                            self.add_watch_recursive(&mut state, rel_path.clone(), false);
                         }
 
-                        let event_type = if is_create && watch_create {
+                        let event_type = if is_create && self.watch_create {
                             WatchEvent::Create
-                        } else if is_delete && watch_delete {
+                        } else if is_delete && self.watch_delete {
                             WatchEvent::Delete
-                        } else if is_update && watch_update {
+                        } else if is_update && self.watch_update {
                             WatchEvent::Update
                         } else {
                             continue
                         };
 
-                        if if is_dir { !match_dirs } else { !match_files } {
+                        if if is_dir { !self.match_dirs } else { !self.match_files } {
                             continue;
                         }
 
-                        if !should_watch(&rel_path, &include_patterns, &exclude_patterns, false) {
+                        if !self.should_watch(&state, &rel_path, false) {
                             continue;
                         }
 
@@ -1034,16 +1067,8 @@ impl WatchBuilder {
                         
                         // Do callback if not in debounce mode
                         if debounce.is_none() {
-                            let callback_path = if return_absolute {
-                                if rel_path.as_os_str().is_empty() {
-                                    root.clone()
-                                } else {
-                                    root.join(&rel_path)
-                                }
-                            } else {
-                                rel_path
-                            };
-                            callback(event_type, callback_path);
+                            let path = self.make_callback_path(&state, &rel_path);
+                            (state.callback)(event_type, path);
                         }
                     }
                     
@@ -1075,6 +1100,7 @@ mod tests {
         Create,
         Delete,
         Update,
+        Initial,
         DebugWatch,
     }
 
@@ -1095,7 +1121,7 @@ mod tests {
     impl TestInstance {
         async fn new<F>(test_name: &str, configure: F) -> Self
         where
-            F: FnOnce(WatchBuilder) -> WatchBuilder + Send + 'static,
+            F: FnOnce(Watcher) -> Watcher + Send + 'static,
         {
             let test_dir = std::env::current_dir()
                 .unwrap()
@@ -1112,13 +1138,13 @@ mod tests {
             let test_dir_clone = test_dir.clone();
 
             let watcher_handle = tokio::spawn(async move {
-                let builder = WatchBuilder::new()
+                let watcher = Watcher::new()
                     .set_base_dir(&test_dir_clone)
                     .debug_watches(true);
 
-                let builder = configure(builder);
+                let watcher = configure(watcher);
 
-                let _ = builder
+                let _ = watcher
                     .run(move |event_type, path| {
                         tracker_clone.lock().unwrap().push(Event {
                             path: path.clone(),
@@ -1126,6 +1152,7 @@ mod tests {
                                 WatchEvent::Create => EventType::Create,
                                 WatchEvent::Delete => EventType::Delete,
                                 WatchEvent::Update => EventType::Update,
+                                WatchEvent::Initial => EventType::Initial,
                                 WatchEvent::DebugWatch => EventType::DebugWatch,
                             },
                         });
@@ -1384,7 +1411,7 @@ mod tests {
         let test_dir_clone = test_dir.clone();
 
         let watcher_handle = tokio::spawn(async move {
-            let _ = WatchBuilder::new()
+            let _ = Watcher::new()
                 .set_base_dir(&test_dir_clone)
                 .debug_watches(true)
                 .add_include("**/*")
@@ -1396,6 +1423,7 @@ mod tests {
                             WatchEvent::Create => EventType::Create,
                             WatchEvent::Delete => EventType::Delete,
                             WatchEvent::Update => EventType::Update,
+                            WatchEvent::Initial => EventType::Initial,
                             WatchEvent::DebugWatch => EventType::DebugWatch,
                         },
                     });
@@ -1439,6 +1467,222 @@ mod tests {
                 .iter()
                 .any(|e| e.path == PathBuf::from("normal.txt"));
             assert!(has_normal, "Expected event for normal.txt, got: {:?}", events);
+        }
+
+        // Cleanup
+        watcher_handle.abort();
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_watch_initial() {
+        // Setup: create test directory and files before starting watcher
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join(".file-watcher-test-watch_initial");
+
+        if test_dir.exists() {
+            std::fs::remove_dir_all(&test_dir).unwrap();
+        }
+        std::fs::create_dir(&test_dir).unwrap();
+
+        // Create some files before starting the watcher
+        std::fs::write(test_dir.join("existing1.txt"), "content1").unwrap();
+        std::fs::write(test_dir.join("existing2.txt"), "content2").unwrap();
+        std::fs::create_dir(test_dir.join("subdir")).unwrap();
+        std::fs::write(test_dir.join("subdir/nested.txt"), "nested").unwrap();
+        std::fs::write(test_dir.join("ignored.rs"), "should be ignored").unwrap();
+
+        let tracker = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let tracker_clone = tracker.clone();
+        let test_dir_clone = test_dir.clone();
+
+        let watcher_handle = tokio::spawn(async move {
+            let _ = Watcher::new()
+                .set_base_dir(&test_dir_clone)
+                .add_include("**/*.txt")
+                .watch_initial(true)
+                .run(move |event_type, path| {
+                    tracker_clone.lock().unwrap().push(Event {
+                        path: path.clone(),
+                        event_type: match event_type {
+                            WatchEvent::Create => EventType::Create,
+                            WatchEvent::Delete => EventType::Delete,
+                            WatchEvent::Update => EventType::Update,
+                            WatchEvent::Initial => EventType::Initial,
+                            WatchEvent::DebugWatch => EventType::DebugWatch,
+                        },
+                    });
+                })
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Check that Initial events were emitted for preexisting .txt files
+        {
+            let events = tracker.lock().unwrap();
+            let initial_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == EventType::Initial)
+                .collect();
+
+            assert_eq!(
+                initial_events.len(),
+                3,
+                "Expected 3 Initial events, got: {:?}",
+                initial_events
+            );
+
+            let paths: HashSet<_> = initial_events.iter().map(|e| e.path.clone()).collect();
+            assert!(paths.contains(&PathBuf::from("existing1.txt")));
+            assert!(paths.contains(&PathBuf::from("existing2.txt")));
+            assert!(paths.contains(&PathBuf::from("subdir/nested.txt")));
+
+            // .rs file should not have Initial event
+            assert!(!events.iter().any(|e| e.path.to_string_lossy().contains("ignored.rs")));
+        }
+
+        tracker.lock().unwrap().clear();
+
+        // Verify normal events still work after initial scan
+        std::fs::write(test_dir.join("new.txt"), "new content").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        {
+            let events = tracker.lock().unwrap();
+            let has_create = events
+                .iter()
+                .any(|e| e.path == PathBuf::from("new.txt") && e.event_type == EventType::Create);
+            assert!(has_create, "Expected Create event for new.txt, got: {:?}", events);
+        }
+
+        // Cleanup
+        watcher_handle.abort();
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_watch_initial_with_dirs() {
+        // Test that watch_initial respects match_dirs setting
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join(".file-watcher-test-watch_initial_dirs");
+
+        if test_dir.exists() {
+            std::fs::remove_dir_all(&test_dir).unwrap();
+        }
+        std::fs::create_dir(&test_dir).unwrap();
+
+        // Create files and directories
+        std::fs::write(test_dir.join("file.txt"), "content").unwrap();
+        std::fs::create_dir(test_dir.join("mydir")).unwrap();
+
+        let tracker = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let tracker_clone = tracker.clone();
+        let test_dir_clone = test_dir.clone();
+
+        let watcher_handle = tokio::spawn(async move {
+            let _ = Watcher::new()
+                .set_base_dir(&test_dir_clone)
+                .add_include("**/*")
+                .watch_initial(true)
+                .match_files(true)
+                .match_dirs(false)  // Only files, not directories
+                .run(move |event_type, path| {
+                    tracker_clone.lock().unwrap().push(Event {
+                        path: path.clone(),
+                        event_type: match event_type {
+                            WatchEvent::Create => EventType::Create,
+                            WatchEvent::Delete => EventType::Delete,
+                            WatchEvent::Update => EventType::Update,
+                            WatchEvent::Initial => EventType::Initial,
+                            WatchEvent::DebugWatch => EventType::DebugWatch,
+                        },
+                    });
+                })
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        {
+            let events = tracker.lock().unwrap();
+            let initial_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == EventType::Initial)
+                .collect();
+
+            // Should only have Initial for file.txt, not mydir
+            assert_eq!(
+                initial_events.len(),
+                1,
+                "Expected 1 Initial event (file only), got: {:?}",
+                initial_events
+            );
+            assert_eq!(initial_events[0].path, PathBuf::from("file.txt"));
+        }
+
+        // Cleanup
+        watcher_handle.abort();
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    #[tokio::test]
+    async fn test_watch_initial_disabled_by_default() {
+        // Test that watch_initial is disabled by default
+        let test_dir = std::env::current_dir()
+            .unwrap()
+            .join(".file-watcher-test-watch_initial_disabled");
+
+        if test_dir.exists() {
+            std::fs::remove_dir_all(&test_dir).unwrap();
+        }
+        std::fs::create_dir(&test_dir).unwrap();
+
+        // Create a file before starting watcher
+        std::fs::write(test_dir.join("existing.txt"), "content").unwrap();
+
+        let tracker = Arc::new(Mutex::new(Vec::<Event>::new()));
+        let tracker_clone = tracker.clone();
+        let test_dir_clone = test_dir.clone();
+
+        let watcher_handle = tokio::spawn(async move {
+            let _ = Watcher::new()
+                .set_base_dir(&test_dir_clone)
+                .add_include("**/*.txt")
+                // watch_initial not enabled (default is false)
+                .run(move |event_type, path| {
+                    tracker_clone.lock().unwrap().push(Event {
+                        path: path.clone(),
+                        event_type: match event_type {
+                            WatchEvent::Create => EventType::Create,
+                            WatchEvent::Delete => EventType::Delete,
+                            WatchEvent::Update => EventType::Update,
+                            WatchEvent::Initial => EventType::Initial,
+                            WatchEvent::DebugWatch => EventType::DebugWatch,
+                        },
+                    });
+                })
+                .await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        {
+            let events = tracker.lock().unwrap();
+            let initial_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == EventType::Initial)
+                .collect();
+
+            // Should have no Initial events since watch_initial is disabled
+            assert_eq!(
+                initial_events.len(),
+                0,
+                "Expected no Initial events when watch_initial is disabled, got: {:?}",
+                initial_events
+            );
         }
 
         // Cleanup
