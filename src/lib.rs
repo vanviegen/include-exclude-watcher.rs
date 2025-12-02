@@ -843,16 +843,11 @@ impl Watcher {
         state.include_patterns.iter().any(|p| p.check(&segments, is_dir))
     }
 
-    fn make_callback_path<F>(&self, state: &WatcherState<F>, rel_path: &Path) -> PathBuf {
-        if self.return_absolute {
-            if rel_path.as_os_str().is_empty() {
-                state.root.clone()
-            } else {
-                state.root.join(rel_path)
-            }
-        } else {
-            rel_path.to_path_buf()
+    fn check_event<F>(&self, state: &WatcherState<F>, rel_path: &Path, is_dir: bool) -> bool {
+        if if is_dir { !self.match_dirs } else { !self.match_files } {
+            return false;
         }
+        self.should_watch(state, rel_path, false)
     }
 
     fn emit_event<F>(
@@ -860,19 +855,18 @@ impl Watcher {
         state: &mut WatcherState<F>,
         event: WatchEvent,
         rel_path: &Path,
-        is_dir: bool,
     ) where
         F: FnMut(WatchEvent, PathBuf),
     {
-        if if is_dir { !self.match_dirs } else { !self.match_files } {
-            return;
-        }
-
-        if !self.should_watch(state, rel_path, false) {
-            return;
-        }
-
-        let path = self.make_callback_path(state, rel_path);
+        let path = if self.return_absolute {
+            if rel_path.as_os_str().is_empty() {
+                state.root.clone()
+            } else {
+                state.root.join(rel_path)
+            }
+        } else {
+            rel_path.to_path_buf()
+        };
         (state.callback)(event, path);
     }
 
@@ -916,8 +910,7 @@ impl Watcher {
             state.watches.insert(wd, rel_path.clone());
 
             if self.debug_watches_enabled {
-                let path = self.make_callback_path(state, &rel_path);
-                (state.callback)(WatchEvent::DebugWatch, path);
+                (state.callback)(WatchEvent::DebugWatch, rel_path.clone());
             }
 
             if let Ok(entries) = std::fs::read_dir(&full_path) {
@@ -926,8 +919,8 @@ impl Watcher {
                         let child_rel_path = rel_path.join(entry.file_name());
                         let is_dir = ft.is_dir();
 
-                        if emit_initial {
-                            self.emit_event(state, WatchEvent::Initial, &child_rel_path, is_dir);
+                        if emit_initial && self.check_event(state, &child_rel_path, is_dir) {
+                            self.emit_event(state, WatchEvent::Initial, &child_rel_path);
                         }
 
                         if is_dir && !state.paths.contains(&child_rel_path) {
@@ -1055,20 +1048,15 @@ impl Watcher {
                             continue
                         };
 
-                        if if is_dir { !self.match_dirs } else { !self.match_files } {
-                            continue;
-                        }
-
-                        if !self.should_watch(&state, &rel_path, false) {
+                        if !self.check_event(&state, &rel_path, is_dir) {
                             continue;
                         }
 
                         had_matching_event = true;
-                        
-                        // Do callback if not in debounce mode
+
+                        // Emit event if not in debounce mode
                         if debounce.is_none() {
-                            let path = self.make_callback_path(&state, &rel_path);
-                            (state.callback)(event_type, path);
+                            self.emit_event(&mut state, event_type, &rel_path);
                         }
                     }
                     
