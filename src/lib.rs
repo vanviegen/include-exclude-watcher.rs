@@ -52,8 +52,8 @@
 //!     Watcher::new()
 //!         .set_base_dir("./src")
 //!         .add_include("**/*.rs")
-//!         .run_debounced(500, || {
-//!             println!("Files changed!");
+//!         .run_debounced(500, |first_changed_path| {
+//!             println!("Files changed! First: {}", first_changed_path.display());
 //!         })
 //!         .await
 //! }
@@ -824,13 +824,12 @@ impl Watcher {
     /// at least `ms` milliseconds before calling the callback. This is useful
     /// for batching rapid changes (like when a build tool writes many files).
     ///
-    /// The callback takes no arguments since the specific paths are not tracked
-    /// during debouncing.
+    /// The callback receives the path of the first file that changed.
     pub async fn run_debounced<F>(self, ms: u64, mut callback: F) -> Result<()>
     where
-        F: FnMut(),
+        F: FnMut(PathBuf),
     {
-        self.run_internal(|_, _| callback(), Some(Duration::from_millis(ms))).await
+        self.run_internal(|_, path| callback(path), Some(Duration::from_millis(ms))).await
     }
 
     fn should_watch<F>(&self, state: &WatcherState<F>, relative_path: &Path, is_dir: bool) -> bool {
@@ -974,6 +973,7 @@ impl Watcher {
 
         // Debouncing state
         let mut debounce_deadline: Option<tokio::time::Instant> = None;
+        let mut debounce_first_path: Option<PathBuf> = None;
 
         // Event loop
         let mut buffer = [0u8; 8192];
@@ -986,7 +986,7 @@ impl Watcher {
                 if deadline <= now {
                     // Timer expired, fire callback and reset
                     debounce_deadline = None;
-                    (state.callback)(WatchEvent::Update, PathBuf::new());
+                    (state.callback)(WatchEvent::Update, debounce_first_path.take().unwrap_or_default());
                     continue;
                 }
                 // Wait with timeout
@@ -995,7 +995,7 @@ impl Watcher {
                     Err(_) => {
                         // Timeout expired, fire callback
                         debounce_deadline = None;
-                        (state.callback)(WatchEvent::Update, PathBuf::new());
+                        (state.callback)(WatchEvent::Update, debounce_first_path.take().unwrap_or_default());
                         continue;
                     }
                 }
@@ -1008,7 +1008,7 @@ impl Watcher {
             match result {
                 Ok(len) => {
                     let events = parse_inotify_events(&buffer, len);
-                    let mut had_matching_event = false;
+                    let mut first_matching_path: Option<PathBuf> = None;
 
                     for (wd, mask, name_str) in events {
                         if (mask & libc::IN_IGNORED as u32) != 0 {
@@ -1052,7 +1052,9 @@ impl Watcher {
                             continue;
                         }
 
-                        had_matching_event = true;
+                        if first_matching_path.is_none() {
+                            first_matching_path = Some(rel_path.clone());
+                        }
 
                         // Emit event if not in debounce mode
                         if debounce.is_none() {
@@ -1062,7 +1064,10 @@ impl Watcher {
                     
                     // If debouncing and we had events, reset the timer
                     if let Some(d) = debounce {
-                        if had_matching_event {
+                        if let Some(path) = first_matching_path {
+                            if debounce_first_path.is_none() {
+                                debounce_first_path = Some(path);
+                            }
                             debounce_deadline = Some(tokio::time::Instant::now() + d);
                         }
                     }

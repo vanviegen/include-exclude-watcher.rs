@@ -1,6 +1,6 @@
 [package]
 name = "include-exclude-watcher"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 authors = ["Frank van Viegen <frank@vanviegen.net>"]
 description = "Async file watcher with glob-based include/exclude patterns and built-in debouncing"
