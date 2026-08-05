@@ -381,7 +381,7 @@ impl Pattern {
 
         // We have an exact match. However when in allow_prefix mode, that means this directory is the target
         // and its contents does not need to be watched.
-        return !allow_prefix;
+        !allow_prefix
     }
 }
 
@@ -481,7 +481,7 @@ fn parse_inotify_events(buffer: &[u8], len: usize) -> Vec<(i32, u32, String)> {
         if name_len > 0 {
             let name_ptr = unsafe { ptr.add(std::mem::size_of::<libc::inotify_event>()) };
             let name_slice =
-                unsafe { std::slice::from_raw_parts(name_ptr as *const u8, name_len) };
+                unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
             let name_str = String::from_utf8_lossy(name_slice)
                 .trim_matches(char::from(0))
                 .to_string();
@@ -1063,7 +1063,7 @@ impl Watcher {
                     let mut first_matching_path: Option<PathBuf> = None;
 
                     for (wd, mask, name_str) in events {
-                        if (mask & libc::IN_IGNORED as u32) != 0 {
+                        if (mask & libc::IN_IGNORED) != 0 {
                             if let Some(path) = state.watches.remove(&wd) {
                                 state.paths.remove(&path);
                             }
@@ -1077,13 +1077,13 @@ impl Watcher {
                             continue;
                         };
 
-                        let is_dir = mask & libc::IN_ISDIR as u32 != 0;
-                        let is_create = (mask & libc::IN_CREATE as u32) != 0
-                            || (mask & libc::IN_MOVED_TO as u32) != 0;
-                        let is_delete = (mask & libc::IN_DELETE as u32) != 0
-                            || (mask & libc::IN_MOVED_FROM as u32) != 0;
-                        let is_update = (mask & libc::IN_MODIFY as u32) != 0
-                            || (mask & libc::IN_CLOSE_WRITE as u32) != 0;
+                        let is_dir = mask & libc::IN_ISDIR != 0;
+                        let is_create = (mask & libc::IN_CREATE) != 0
+                            || (mask & libc::IN_MOVED_TO) != 0;
+                        let is_delete = (mask & libc::IN_DELETE) != 0
+                            || (mask & libc::IN_MOVED_FROM) != 0;
+                        let is_update = (mask & libc::IN_MODIFY) != 0
+                            || (mask & libc::IN_CLOSE_WRITE) != 0;
 
                         if is_dir && is_create {
                             // New directory created 
@@ -1510,7 +1510,7 @@ mod tests {
             let events = tracker.lock().unwrap();
             let has_normal = events
                 .iter()
-                .any(|e| e.path == PathBuf::from("normal.txt"));
+                .any(|e| e.path == Path::new("normal.txt"));
             assert!(has_normal, "Expected event for normal.txt, got: {:?}", events);
         }
 
@@ -1598,7 +1598,7 @@ mod tests {
             let events = tracker.lock().unwrap();
             let has_create = events
                 .iter()
-                .any(|e| e.path == PathBuf::from("new.txt") && e.event_type == EventType::Create);
+                .any(|e| e.path == Path::new("new.txt") && e.event_type == EventType::Create);
             assert!(has_create, "Expected Create event for new.txt, got: {:?}", events);
         }
 
