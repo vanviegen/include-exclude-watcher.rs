@@ -12,6 +12,7 @@
 //! - **Glob patterns**: Supports `*`, `**`, `?`, and character classes like `[a-z]`
 //! - **Include/exclude filtering**: Gitignore-style pattern matching with exclude taking precedence
 //! - **Pattern files**: Load patterns from `.gitignore`-style files
+//! - **Standalone matching**: Apply the same patterns to paths from other sources with [`Matcher`]
 //! - **Event filtering**: Watch only creates, deletes, updates, or any combination
 //! - **Type filtering**: Match only files, only directories, or both
 //! - **Debouncing**: Built-in debounce support to batch rapid changes
@@ -524,6 +525,57 @@ pub enum WatchEvent {
     /// Only emitted when [`Watcher::debug_watches`] is enabled. Useful for
     /// understanding which directories are being watched based on your patterns.
     DebugWatch,
+}
+
+/// Match paths against include/exclude patterns, without watching anything.
+///
+/// This uses the same pattern syntax as [`Watcher`] (see [`Watcher::add_include`]), exposed for
+/// callers that receive paths from somewhere else - a single watcher covering many
+/// independently-configured subtrees, say - and need to decide for themselves which set of rules
+/// a path belongs to.
+///
+/// A pattern naming a directory covers everything inside it. For excludes this mirrors the
+/// watcher exactly: it never descends into an excluded directory, so nothing in there is ever
+/// reported. For includes this is slightly more lenient than the watcher's event filter, which
+/// reports the named directory itself but requires `dir/**` to report its contents.
+///
+/// ```
+/// use include_exclude_watcher::Matcher;
+///
+/// let matcher = Matcher::new(&["**/*"], &["node_modules", "*.log"]);
+/// assert!(matcher.matches("src/main.rs"));
+/// assert!(!matcher.matches("node_modules/left-pad/index.js"));
+/// assert!(!matcher.matches("var/app.log"));
+/// ```
+#[derive(Debug, Clone)]
+pub struct Matcher {
+    includes: Vec<Pattern>,
+    excludes: Vec<Pattern>,
+}
+
+impl Matcher {
+    /// Create a matcher from include and exclude patterns.
+    ///
+    /// See [`Watcher::add_include`] for the pattern syntax.
+    pub fn new<I: AsRef<str>, E: AsRef<str>>(includes: &[I], excludes: &[E]) -> Self {
+        Matcher {
+            includes: includes.iter().map(|p| Pattern::parse(p.as_ref())).collect(),
+            excludes: excludes.iter().map(|p| Pattern::parse(p.as_ref())).collect(),
+        }
+    }
+
+    /// Whether `path` matches at least one include pattern and no exclude pattern.
+    ///
+    /// The path is interpreted like the watcher's relative paths: `/`-separated, relative to
+    /// whatever the patterns are anchored to.
+    pub fn matches(&self, path: impl AsRef<Path>) -> bool {
+        let segments = path_to_segments(path.as_ref());
+        let any_match = |patterns: &[Pattern]| {
+            (1..=segments.len())
+                .any(|end| patterns.iter().any(|p| p.check(&segments[..end], false)))
+        };
+        !any_match(&self.excludes) && any_match(&self.includes)
+    }
 }
 
 /// Builder for configuring and running a file watcher.
@@ -1681,5 +1733,96 @@ mod tests {
         // Cleanup
         watcher_handle.abort();
         let _ = std::fs::remove_dir_all(&test_dir);
+    }
+}
+
+#[cfg(test)]
+mod matcher_tests {
+    use super::Matcher;
+
+    fn matcher(includes: &[&str], excludes: &[&str]) -> Matcher {
+        Matcher::new(includes, excludes)
+    }
+
+    #[test]
+    fn matches_everything_by_default() {
+        let m = matcher(&["**/*"], &[]);
+        assert!(m.matches("index.html"));
+        assert!(m.matches("src/deep/file.rs"));
+    }
+
+    #[test]
+    fn patterns_without_a_slash_match_at_any_depth() {
+        let m = matcher(&["**/*"], &["node_modules", "*.log"]);
+        assert!(!m.matches("node_modules/x/y.js"));
+        assert!(!m.matches("deep/node_modules/x.js"));
+        assert!(!m.matches("app.log"));
+        assert!(!m.matches("var/logs/app.log"));
+        assert!(m.matches("app.rs"));
+    }
+
+    #[test]
+    fn a_leading_slash_anchors_to_the_root() {
+        let m = matcher(&["**/*"], &["/webcentral.conf", "/_data"]);
+        assert!(!m.matches("webcentral.conf"));
+        assert!(!m.matches("_data/log/x.log"));
+        assert!(m.matches("sub/webcentral.conf"));
+    }
+
+    #[test]
+    fn naming_a_directory_covers_its_contents() {
+        let m = matcher(&["src", "config.yaml"], &[]);
+        assert!(m.matches("src"));
+        assert!(m.matches("src/main.rs"));
+        assert!(m.matches("src/deep/main.rs"));
+        assert!(m.matches("config.yaml"));
+        assert!(!m.matches("other.txt"));
+    }
+
+    #[test]
+    fn double_wildcards_span_directories() {
+        let m = matcher(&["src/**"], &[]);
+        assert!(m.matches("src/main.rs"));
+        assert!(m.matches("src/deep/main.rs"));
+        assert!(!m.matches("other/main.rs"));
+    }
+
+    #[test]
+    fn wildcards_within_a_segment() {
+        let m = matcher(&["*.py", "test-?.txt", "[abc]*.md"], &[]);
+        assert!(m.matches("app.py"));
+        assert!(m.matches("deep/app.py"));
+        assert!(!m.matches("app.pyc"));
+        assert!(m.matches("test-1.txt"));
+        assert!(!m.matches("test-12.txt"));
+        assert!(m.matches("a-file.md"));
+        assert!(!m.matches("z-file.md"));
+    }
+
+    #[test]
+    fn negated_and_ranged_classes() {
+        let m = matcher(&["[!abc]*.md", "x[0-9].txt"], &[]);
+        assert!(m.matches("z.md"));
+        assert!(!m.matches("a.md"));
+        assert!(m.matches("x5.txt"));
+        assert!(!m.matches("xa.txt"));
+    }
+
+    #[test]
+    fn excludes_win_over_includes() {
+        let m = matcher(&["src/**"], &["src/build"]);
+        assert!(m.matches("src/main.rs"));
+        assert!(!m.matches("src/build"));
+        assert!(!m.matches("src/build/out.js"));
+    }
+
+    #[test]
+    fn hidden_files_and_swap_files() {
+        let m = matcher(&["**/*"], &[".*", "*.sw?"]);
+        assert!(!m.matches(".env"));
+        assert!(!m.matches(".git/config"));
+        assert!(!m.matches("src/main.swp"));
+        assert!(m.matches("visible.txt"));
+        assert!(m.matches("main.sw"));
     }
 }

@@ -3,7 +3,7 @@
 //! Watch files and directories for changes with glob-based filtering.
 
 use clap::Parser;
-use include_exclude_watcher::{WatchBuilder, WatchEvent};
+use include_exclude_watcher::{Watcher, WatchEvent};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -116,10 +116,16 @@ fn run_shell_command(cmd: &str, file: &str, event: &str) {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> std::io::Result<()> {
     let args = Args::parse();
 
-    let format = OutputFormat::from_str(&args.format).map_err(|e| anyhow::anyhow!(e))?;
+    let format = match OutputFormat::from_str(&args.format) {
+        Ok(format) => format,
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    };
 
     let exit_on_first = args.exit_on_first || format == OutputFormat::Silent;
 
@@ -151,7 +157,7 @@ async fn main() -> anyhow::Result<()> {
         eprintln!("---");
     }
 
-    let mut builder = WatchBuilder::new()
+    let mut builder = Watcher::new()
         .set_base_dir(&args.path)
         .add_includes(includes)
         .add_excludes(args.excludes)
@@ -168,52 +174,15 @@ async fn main() -> anyhow::Result<()> {
     let run_command = args.run_command;
 
     if let Some(debounce_ms) = args.combine {
-        let run_cmd = run_command.clone();
-        if exit_on_first {
-            builder
-                .run_debounced(debounce_ms, move || {
-                    println!("CHANGES");
-                    if let Some(ref cmd) = run_cmd {
-                        run_shell_command(cmd, "", "CHANGES");
-                    }
-                    std::process::exit(0);
-                })
-                .await?;
-        } else {
-            builder
-                .run_debounced(debounce_ms, move || {
-                    println!("CHANGES");
-                    if let Some(ref cmd) = run_cmd {
-                        run_shell_command(cmd, "", "CHANGES");
-                    }
-                })
-                .await?;
-        }
-    } else if exit_on_first {
         builder
-            .run(move |event, path| {
-                let event_type = match event {
-                    WatchEvent::Create => EventType::Create,
-                    WatchEvent::Delete => EventType::Delete,
-                    WatchEvent::Update => EventType::Update,
-                    WatchEvent::DebugWatch => return,
-                };
-
-                match format {
-                    OutputFormat::Default => {
-                        println!("{} {}", event_type.as_str(), path.display());
-                    }
-                    OutputFormat::Path => {
-                        println!("{}", path.display());
-                    }
-                    OutputFormat::Silent => {}
-                }
-
+            .run_debounced(debounce_ms, move |first_changed_path| {
+                println!("CHANGES");
                 if let Some(ref cmd) = run_command {
-                    run_shell_command(cmd, &path.to_string_lossy(), event_type.as_str());
+                    run_shell_command(cmd, &first_changed_path.to_string_lossy(), "CHANGES");
                 }
-
-                std::process::exit(0);
+                if exit_on_first {
+                    std::process::exit(0);
+                }
             })
             .await?;
     } else {
@@ -223,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
                     WatchEvent::Create => EventType::Create,
                     WatchEvent::Delete => EventType::Delete,
                     WatchEvent::Update => EventType::Update,
-                    WatchEvent::DebugWatch => return,
+                    WatchEvent::Initial | WatchEvent::DebugWatch => return,
                 };
 
                 match format {
@@ -238,6 +207,10 @@ async fn main() -> anyhow::Result<()> {
 
                 if let Some(ref cmd) = run_command {
                     run_shell_command(cmd, &path.to_string_lossy(), event_type.as_str());
+                }
+
+                if exit_on_first {
+                    std::process::exit(0);
                 }
             })
             .await?;

@@ -22,7 +22,7 @@ Tradeoffs:
 
 ```toml
 [dependencies]
-include-exclude-watcher = "0.1"
+include-exclude-watcher = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -31,11 +31,11 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ### Basic watching
 
 ```rust
-use include_exclude_watcher::{WatchBuilder, WatchEvent};
+use include_exclude_watcher::{Watcher, WatchEvent};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    WatchBuilder::new()
+    Watcher::new()
         .add_include("**/*.rs")
         .add_exclude("**/target/**")
         .run(|event, path| {
@@ -50,15 +50,15 @@ This uses the current working directory as its base directory.
 ### With debouncing
 
 ```rust
-use include_exclude_watcher::WatchBuilder;
+use include_exclude_watcher::Watcher;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    WatchBuilder::new()
+    Watcher::new()
         .set_base_dir("./src")
         .add_include("**/*.rs")
-        .run_debounced(500, || {
-            println!("Files changed, rebuilding...");
+        .run_debounced(500, |first_changed_path| {
+            println!("{} changed, rebuilding...", first_changed_path.display());
         })
         .await
 }
@@ -67,11 +67,11 @@ async fn main() -> anyhow::Result<()> {
 ### Loading patterns from files
 
 ```rust
-use include_exclude_watcher::WatchBuilder;
+use include_exclude_watcher::Watcher;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    WatchBuilder::new()
+    Watcher::new()
         .set_base_dir("/project")
         .add_include("**/*")
         .add_ignore_file(".gitignore")
@@ -87,6 +87,20 @@ Pattern files use gitignore syntax:
 - Lines starting with `#` are comments
 - Other non-empty lines are exclude patterns
 - Note: `!` negation patterns are not supported (excludes always take precedence over includes)
+
+### Standalone matching
+
+`Matcher` applies the same pattern language to paths you already have, without
+watching anything — useful for routing paths received from elsewhere (e.g. one
+watcher covering several independently-configured subtrees):
+
+```rust
+use include_exclude_watcher::Matcher;
+
+let matcher = Matcher::new(&["**/*"], &["node_modules", "*.log"]);
+assert!(matcher.matches("src/main.rs"));
+assert!(!matcher.matches("node_modules/left-pad/index.js"));
+```
 
 ## Pattern syntax
 
